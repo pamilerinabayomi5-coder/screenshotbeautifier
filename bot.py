@@ -1,8 +1,9 @@
 import os
 import logging
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageDraw
 
 # Setup logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -12,31 +13,32 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a welcoming message when the command /start is issued."""
     await update.message.reply_text("👋 Send me a screenshot, and I will beautify it for you!")
 
 async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes the incoming screenshot, applies padding, rounded corners, and a clean background."""
     # Get the highest resolution photo sent
     photo_file = await update.message.photo[-1].get_file()
     
     input_path = "input.png"
-    output_path = "beautified.png"
+    output_path = "beautified.jpg"
     
     # Download the screenshot locally
     await photo_file.download_to_drive(input_path)
     await update.message.reply_chat_action(action="upload_document")
 
     try:
-        # Open the image
+        # Open the image and convert to RGBA for transparency handling (rounded corners)
         img = Image.open(input_path).convert("RGBA")
         
-        # 1. Settings for beautification
+        # 1. Canvas Settings
         padding = 80
-        bg_color = (30, 41, 59, 255)  # Modern Slate Dark background
+        bg_color = (30, 41, 59, 255)  # Modern Slate Dark background (#1e293b)
+        radius = 24                   # Corner rounding radius
         
         # 2. Add rounded corners to the screenshot
-        radius = 24
         mask = Image.new("L", img.size, 0)
-        from PIL import ImageDraw
         draw = ImageDraw.Draw(mask)
         draw.rounded_rectangle((0, 0, img.size[0], img.size[1]), radius=radius, fill=255)
         img = ImageOps.fit(img, img.size, keep_aspect=True)
@@ -47,10 +49,10 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         new_height = img.size[1] + (padding * 2)
         canvas = Image.new("RGBA", (new_width, new_height), bg_color)
         
-        # 4. Paste screenshot onto canvas
+        # 4. Paste screenshot onto the center of the canvas
         canvas.paste(img, (padding, padding), img)
         
-        # Save output
+        # Save output as a high-quality JPEG
         canvas.convert("RGB").save(output_path, "JPEG", quality=95)
         
         # Send the beautified image back as a high-quality document
@@ -61,25 +63,49 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Error processing image: {e}")
         await update.message.reply_text("❌ Sorry, something went wrong while styling your screenshot.")
     finally:
-        # Cleanup files
-        if os.path.exists(input_path): os.remove(input_path)
-        if os.path.exists(output_path): os.remove(output_path)
+        # Cleanup files to keep the container storage clean
+        if os.path.exists(input_path): 
+            os.remove(input_path)
+        if os.path.exists(output_path): 
+            os.remove(output_path)
 
-def main():
+async def main_async():
+    """Asynchronous entry point to configure and start the bot polling loop."""
     if not TOKEN:
         logger.error("No TELEGRAM_BOT_TOKEN environment variable found!")
         return
 
-    # Build application
+    # Build the application
     app = Application.builder().token(TOKEN).build()
     
-    # Add handlers
+    # Add command and message handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
     
-    # Start polling (Crucial for Render Background Worker)
     logger.info("Bot started via polling...")
-    app.run_polling()
+    
+    # Initialize and start polling within the current event loop context
+    await app.initialize()
+    await app.updater.start_polling()
+    await app.start()
+    
+    # Keep running until interrupted (Render worker lifecycle management)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Stopping bot...")
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+def main():
+    """Main execution entrypoint using an isolated event loop manager."""
+    try:
+        asyncio.run(main_async())
+    except Exception as e:
+        logger.critical(f"Application crashed: {e}")
 
 if __name__ == '__main__':
     main()
